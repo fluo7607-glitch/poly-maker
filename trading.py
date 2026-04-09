@@ -125,6 +125,26 @@ def send_sell_order(order):
 # Dictionary to store locks for each market to prevent concurrent trading on the same market
 market_locks = {}
 
+def _get_market_reference_time(row):
+    """
+    Pick the best available market timestamp from sheet data.
+    """
+    time_cols = [
+        'start_date_iso',
+        'start_date',
+        'start_time',
+        'event_start_time',
+        'end_date_iso',
+        'end_date',
+    ]
+    for col in time_cols:
+        if col in row and pd.notna(row[col]) and str(row[col]).strip() != "":
+            try:
+                return pd.to_datetime(row[col], utc=True)
+            except Exception:
+                continue
+    return None
+
 async def perform_trade(market):
     """
     Main trading function that handles market making for a specific market.
@@ -148,6 +168,18 @@ async def perform_trade(market):
             client = global_state.client
             # Get market details from the configuration
             row = global_state.df[global_state.df['condition_id'] == market].iloc[0]      
+
+            # Rule 1: do not quote markets that are within 6 hours of their reference time.
+            # Cancel only this market's orders and skip trading it.
+            market_ref_time = _get_market_reference_time(row)
+            if market_ref_time is not None:
+                now_utc = pd.Timestamp.utcnow().tz_localize('UTC')
+                hours_left = (market_ref_time - now_utc).total_seconds() / 3600
+                if 0 <= hours_left <= 6:
+                    print(f"Skipping market {market}: {hours_left:.2f}h left to reference time. Cancelling this market's orders.")
+                    client.cancel_all_market(market)
+                    return
+
             # Determine decimal precision from tick size
             round_length = len(str(row['tick_size']).split(".")[1])
 
@@ -255,6 +287,10 @@ async def perform_trade(market):
                       f"avgPrice: {avgPrice}, Best Bid: {best_bid}, Best Ask: {best_ask}, "
                       f"Bid Price: {bid_price}, Ask Price: {ask_price}, Mid Price: {mid_price}")
 
+                # Rule 2: if front book size is too thin (< min_size * 2), cancel this token's orders.
+                # Apply separately for buy and sell sides via the relevant front size.
+                min_front_size = row['min_size'] * 2
+
                 # Get position for the opposite token to calculate total exposure
                 other_token = global_state.REVERSE_TOKENS[str(token)]
                 other_position = get_position(other_token)['size']
@@ -352,6 +388,11 @@ async def perform_trade(market):
                 # 2. Position is less than absolute cap (250)
                 # 3. Buy amount is above minimum size
                 if position < max_size and position < 250 and buy_amount > 0 and buy_amount >= row['min_size']:
+                    if best_bid_size is None or best_bid_size < min_front_size:
+                        print(f"Cancelling buy orders for {token}: front bid size {best_bid_size} < {min_front_size}")
+                        client.cancel_all_asset(order['token'])
+                        continue
+
                     # Get reference price from market data
                     sheet_value = row['best_bid']
 
@@ -430,6 +471,11 @@ async def perform_trade(market):
                         
                 # ------- TAKE PROFIT / SELL ORDER MANAGEMENT -------            
                 elif sell_amount > 0:
+                    if best_ask_size is None or best_ask_size < min_front_size:
+                        print(f"Cancelling sell orders for {token}: front ask size {best_ask_size} < {min_front_size}")
+                        client.cancel_all_asset(order['token'])
+                        continue
+
                     order['size'] = sell_amount
                     
                     # Calculate take-profit price based on average cost

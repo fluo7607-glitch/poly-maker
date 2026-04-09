@@ -142,6 +142,10 @@ def process_user_data(rows):
 
                     print("Matched. Performing is ", len(global_state.performing[col]))
                     set_position(token, side, size, price)
+                    # Rule 3: on any of our matched trades, immediately cancel remaining orders
+                    # for this market only (not all markets).
+                    global_state.client.cancel_all_market(market)
+                    print(f"Cancelled remaining orders for matched market {market}")
                     print("Position after matching is ", global_state.positions[str(token)])
                     print("Last trade update is ", global_state.last_trade_update)
                     print("Performing is ", global_state.performing)
