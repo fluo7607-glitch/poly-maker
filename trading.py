@@ -145,6 +145,24 @@ def _get_market_reference_time(row):
                 continue
     return None
 
+def _queue_ahead_size(order_book_side, side, order_price):
+    """
+    Compute shares ahead of our order price.
+    BUY: ahead means better bid prices (> order_price)
+    SELL: ahead means better ask prices (< order_price)
+    """
+    if order_book_side is None:
+        return 0.0
+
+    if side == 'buy':
+        return sum(size for price, size in order_book_side.items() if price > order_price)
+    if side == 'sell':
+        return sum(size for price, size in order_book_side.items() if price < order_price)
+    return 0.0
+
+def _is_thin_depth(ahead_size, min_size):
+    return ahead_size <= (min_size * 2)
+
 async def perform_trade(market):
     """
     Main trading function that handles market making for a specific market.
@@ -291,6 +309,30 @@ async def perform_trade(market):
                 # Apply separately for buy and sell sides via the relevant front size.
                 min_front_size = row['min_size'] * 2
 
+                # Rule 2 (continuous guard): if existing working orders have too little queue ahead,
+                # cancel first, even if this cycle wouldn't place new orders.
+                market_book = global_state.all_data.get(market, {})
+                bids_book = market_book.get('bids', {})
+                asks_book = market_book.get('asks', {})
+
+                existing_buy_price = orders['buy']['price']
+                existing_buy_size = orders['buy']['size']
+                if existing_buy_size > 0 and existing_buy_price > 0:
+                    buy_ahead_size = _queue_ahead_size(bids_book, 'buy', existing_buy_price)
+                    if _is_thin_depth(buy_ahead_size, row['min_size']):
+                        print(f"Cancelling existing BUY for {token}: queue ahead {buy_ahead_size} <= {min_front_size}")
+                        client.cancel_all_asset(order['token'])
+                        continue
+
+                existing_sell_price = orders['sell']['price']
+                existing_sell_size = orders['sell']['size']
+                if existing_sell_size > 0 and existing_sell_price > 0:
+                    sell_ahead_size = _queue_ahead_size(asks_book, 'sell', existing_sell_price)
+                    if _is_thin_depth(sell_ahead_size, row['min_size']):
+                        print(f"Cancelling existing SELL for {token}: queue ahead {sell_ahead_size} <= {min_front_size}")
+                        client.cancel_all_asset(order['token'])
+                        continue
+
                 # Get position for the opposite token to calculate total exposure
                 other_token = global_state.REVERSE_TOKENS[str(token)]
                 other_position = get_position(other_token)['size']
@@ -388,8 +430,9 @@ async def perform_trade(market):
                 # 2. Position is less than absolute cap (250)
                 # 3. Buy amount is above minimum size
                 if position < max_size and position < 250 and buy_amount > 0 and buy_amount >= row['min_size']:
-                    if best_bid_size is None or best_bid_size < min_front_size:
-                        print(f"Cancelling buy orders for {token}: front bid size {best_bid_size} < {min_front_size}")
+                    proposed_buy_ahead = _queue_ahead_size(bids_book, 'buy', bid_price)
+                    if _is_thin_depth(proposed_buy_ahead, row['min_size']):
+                        print(f"Cancelling buy orders for {token}: queue ahead {proposed_buy_ahead} <= {min_front_size}")
                         client.cancel_all_asset(order['token'])
                         continue
 
@@ -471,8 +514,9 @@ async def perform_trade(market):
                         
                 # ------- TAKE PROFIT / SELL ORDER MANAGEMENT -------            
                 elif sell_amount > 0:
-                    if best_ask_size is None or best_ask_size < min_front_size:
-                        print(f"Cancelling sell orders for {token}: front ask size {best_ask_size} < {min_front_size}")
+                    proposed_sell_ahead = _queue_ahead_size(asks_book, 'sell', ask_price)
+                    if _is_thin_depth(proposed_sell_ahead, row['min_size']):
+                        print(f"Cancelling sell orders for {token}: queue ahead {proposed_sell_ahead} <= {min_front_size}")
                         client.cancel_all_asset(order['token'])
                         continue
 
